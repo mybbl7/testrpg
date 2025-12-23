@@ -1,0 +1,306 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>IndexedDB Editor</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 18px; }
+    #dbList, #storeList, #keyList { max-height: 200px; overflow:auto; border:1px solid #ddd; padding:8px; }
+    .row { display:flex; gap:12px; margin-bottom:8px; }
+    textarea { width:100%; height:200px; font-family: monospace; }
+    input[type=file] { display:block; }
+    button { padding:6px 10px; }
+    .mono { font-family: monospace; white-space:pre-wrap; word-break:break-all; }
+  </style>
+</head>
+<body>
+  <h3>IndexedDB Editor</h3>
+
+  <div class="row">
+    <div style="flex:1">
+      <strong>Databases</strong>
+      <div id="dbList">Loading...</div>
+      <button id="refreshDbs">Refresh</button>
+    </div>
+
+    <div style="flex:1">
+      <strong>Object Stores</strong>
+      <div id="storeList">—</div>
+    </div>
+
+    <div style="flex:1">
+      <strong>Keys / Entries</strong>
+      <div id="keyList">—</div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <div>
+    <strong>Selected entry</strong>
+    <div id="meta" class="mono">No entry selected</div>
+
+    <div style="margin-top:8px;">
+      <label><input type="radio" name="view" value="json" checked> JSON / Text</label>
+      <label><input type="radio" name="view" value="base64"> Base64</label>
+      <label><input type="radio" name="view" value="hex"> Hex</label>
+      <label><input type="radio" name="view" value="file"> Upload file</label>
+    </div>
+
+    <textarea id="editor" placeholder="Select an entry to load its value..."></textarea>
+
+    <div style="margin-top:8px;">
+      <input type="file" id="fileInput" />
+      <button id="saveBtn">Save</button>
+      <button id="deleteBtn">Delete</button>
+      <button id="downloadBtn">Download (raw)</button>
+    </div>
+  </div>
+
+<script>
+/* Utility helpers */
+function abToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+function base64ToAb(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+function abToHex(buffer) {
+  const bytes = new Uint8Array(buffer);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+function hexToAb(hex) {
+  if (hex.length % 2) hex = '0' + hex;
+  const len = hex.length / 2;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = parseInt(hex.substr(i*2,2),16);
+  return bytes.buffer;
+}
+
+/* UI elements */
+const dbListEl = document.getElementById('dbList');
+const storeListEl = document.getElementById('storeList');
+const keyListEl = document.getElementById('keyList');
+const editor = document.getElementById('editor');
+const meta = document.getElementById('meta');
+const fileInput = document.getElementById('fileInput');
+const saveBtn = document.getElementById('saveBtn');
+const deleteBtn = document.getElementById('deleteBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const refreshDbs = document.getElementById('refreshDbs');
+
+let current = { dbName:null, storeName:null, key:null, rawValue:null };
+
+/* List databases (modern browsers) */
+async function listDatabases() {
+  dbListEl.innerHTML = 'Loading...';
+  if (indexedDB.databases) {
+    try {
+      const dbs = await indexedDB.databases();
+      dbListEl.innerHTML = '';
+      dbs.forEach(d => {
+        const btn = document.createElement('button');
+        btn.textContent = d.name || '(unnamed)';
+        btn.onclick = () => openDb(d.name);
+        dbListEl.appendChild(btn);
+      });
+      if (dbs.length === 0) dbListEl.textContent = 'No databases found';
+      return;
+    } catch (e) {
+      console.warn('databases() failed', e);
+    }
+  }
+  // Fallback: ask user to type a DB name
+  dbListEl.innerHTML = '';
+  const input = document.createElement('input');
+  input.placeholder = 'Enter DB name (e.g., idbfs)';
+  const openBtn = document.createElement('button');
+  openBtn.textContent = 'Open';
+  openBtn.onclick = () => openDb(input.value.trim());
+  dbListEl.appendChild(input);
+  dbListEl.appendChild(openBtn);
+}
+
+/* Open DB and list object stores */
+function openDb(name) {
+  if (!name) return alert('Provide DB name');
+  const req = indexedDB.open(name);
+  req.onsuccess = () => {
+    const db = req.result;
+    current.dbName = name;
+    storeListEl.innerHTML = '';
+    const stores = Array.from(db.objectStoreNames);
+    if (stores.length === 0) storeListEl.textContent = '(no object stores)';
+    stores.forEach(s => {
+      const b = document.createElement('button');
+      b.textContent = s;
+      b.onclick = () => listKeys(db, s);
+      storeListEl.appendChild(b);
+    });
+    db.close();
+  };
+  req.onerror = () => alert('Failed to open DB: ' + req.error);
+}
+
+/* List keys in a store */
+function listKeys(db, storeName) {
+  current.storeName = storeName;
+  keyListEl.innerHTML = 'Loading...';
+  const r = indexedDB.open(db.name);
+  r.onsuccess = () => {
+    const database = r.result;
+    const tx = database.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const req = store.openCursor();
+    keyListEl.innerHTML = '';
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (!cursor) {
+        if (!keyListEl.hasChildNodes()) keyListEl.textContent = '(empty)';
+        database.close();
+        return;
+      }
+      const key = cursor.key;
+      const btn = document.createElement('button');
+      btn.textContent = String(key);
+      btn.onclick = () => loadEntry(database.name, storeName, key);
+      keyListEl.appendChild(btn);
+      cursor.continue();
+    };
+    req.onerror = () => { keyListEl.textContent = 'Error reading keys'; database.close(); };
+  };
+  r.onerror = () => { keyListEl.textContent = 'Error opening DB'; };
+}
+
+/* Load a single entry */
+function loadEntry(dbName, storeName, key) {
+  current.key = key;
+  const r = indexedDB.open(dbName);
+  r.onsuccess = () => {
+    const database = r.result;
+    const tx = database.transaction(storeName, 'readonly');
+    const store = tx.objectStore(storeName);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const val = req.result;
+      current.rawValue = val;
+      meta.textContent = `DB: ${dbName}\nStore: ${storeName}\nKey: ${key}\nType: ${Object.prototype.toString.call(val)}`;
+      renderValue(val);
+      database.close();
+    };
+    req.onerror = () => { alert('Failed to read entry'); database.close(); };
+  };
+}
+
+/* Render value into editor depending on type and selected view */
+function renderValue(val) {
+  const view = document.querySelector('input[name=view]:checked').value;
+  if (val instanceof ArrayBuffer || (val && val.buffer instanceof ArrayBuffer) || val instanceof Uint8Array) {
+    const buffer = val instanceof ArrayBuffer ? val : (val.buffer ? val.buffer : val);
+    if (view === 'base64') editor.value = abToBase64(buffer);
+    else if (view === 'hex') editor.value = abToHex(buffer);
+    else editor.value = abToBase64(buffer); // default to base64 for binary
+  } else if (val instanceof Blob) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const ab = reader.result;
+      if (view === 'hex') editor.value = abToHex(ab);
+      else editor.value = abToBase64(ab);
+    };
+    reader.readAsArrayBuffer(val);
+  } else {
+    // try JSON stringify
+    try { editor.value = JSON.stringify(val, null, 2); }
+    catch { editor.value = String(val); }
+  }
+}
+
+/* Save edited value back */
+async function saveEntry() {
+  if (!current.dbName || !current.storeName || typeof current.key === 'undefined') return alert('No entry selected');
+  const view = document.querySelector('input[name=view]:checked').value;
+  let newVal;
+  if (view === 'file' && fileInput.files.length) {
+    newVal = await fileInput.files[0].arrayBuffer();
+    newVal = new Uint8Array(newVal);
+  } else if (view === 'base64') {
+    try { newVal = new Uint8Array(base64ToAb(editor.value)); }
+    catch(e){ return alert('Invalid Base64'); }
+  } else if (view === 'hex') {
+    try { newVal = new Uint8Array(hexToAb(editor.value)); }
+    catch(e){ return alert('Invalid hex'); }
+  } else {
+    // try parse JSON, fallback to text
+    try { newVal = JSON.parse(editor.value); }
+    catch { newVal = editor.value; }
+  }
+
+  const r = indexedDB.open(current.dbName);
+  r.onsuccess = () => {
+    const db = r.result;
+    const tx = db.transaction(current.storeName, 'readwrite');
+    const store = tx.objectStore(current.storeName);
+    const putReq = store.put(newVal, current.key);
+    putReq.onsuccess = () => { alert('Saved'); db.close(); listKeys(db, current.storeName); };
+    putReq.onerror = () => { alert('Save failed: ' + putReq.error); db.close(); };
+  };
+}
+
+/* Delete entry */
+function deleteEntry() {
+  if (!current.dbName || !current.storeName || typeof current.key === 'undefined') return alert('No entry selected');
+  const r = indexedDB.open(current.dbName);
+  r.onsuccess = () => {
+    const db = r.result;
+    const tx = db.transaction(current.storeName, 'readwrite');
+    const store = tx.objectStore(current.storeName);
+    const del = store.delete(current.key);
+    del.onsuccess = () => { alert('Deleted'); db.close(); editor.value=''; meta.textContent='No entry selected'; listKeys(db, current.storeName); };
+    del.onerror = () => { alert('Delete failed'); db.close(); };
+  };
+}
+
+/* Download raw binary if available */
+function downloadRaw() {
+  if (!current.rawValue) return alert('No value loaded');
+  let bufferPromise;
+  if (current.rawValue instanceof ArrayBuffer) bufferPromise = Promise.resolve(current.rawValue);
+  else if (current.rawValue instanceof Uint8Array) bufferPromise = Promise.resolve(current.rawValue.buffer);
+  else if (current.rawValue instanceof Blob) bufferPromise = current.rawValue.arrayBuffer();
+  else return alert('Value is not binary');
+  bufferPromise.then(ab => {
+    const blob = new Blob([ab]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${current.storeName}_${String(current.key)}.bin`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+}
+
+/* Event wiring */
+refreshDbs.onclick = listDatabases;
+saveBtn.onclick = saveEntry;
+deleteBtn.onclick = deleteEntry;
+downloadBtn.onclick = downloadRaw;
+document.querySelectorAll('input[name=view]').forEach(r => r.onchange = () => {
+  if (current.rawValue) renderValue(current.rawValue);
+});
+
+listDatabases();
+</script>
+</body>
+</html>
